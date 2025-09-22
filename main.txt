@@ -1,0 +1,321 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/jmoiron/sqlx"
+	"github.com/redis/go-redis/v9"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/crypto/bcrypt"
+	"github.com/golang-jwt/jwt/v5"
+	_ "github.com/lib/pq"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+// Simple configuration via env vars (production should use a config system)
+var (
+	dbDSN       = getEnv("DB_DSN", "postgres://postgres:password@localhost:5432/crm?sslmode=disable")
+	redisAddr   = getEnv("REDIS_ADDR", "localhost:6379")
+	jwtSecret   = []byte(getEnv("JWT_SECRET", "supersecretjwtkey"))
+	listen      = getEnv("LISTEN", ":8080")
+	serviceName = "crm-service"
+)
+
+// Minimal user struct for auth
+type User struct {
+	ID       int64  `db:"id" json:"id"`
+	Email    string `db:"email" json:"email"`
+	Password string `db:"password" json:"-"`
+}
+
+// Customer example
+type Customer struct {
+	ID        int64     `db:"id" json:"id"`
+	Name      string    `db:"name" json:"name"`
+	Email     string    `db:"email" json:"email"`
+	Phone     string    `db:"phone" json:"phone"`
+	CreatedAt time.Time `db:"created_at" json:"created_at"`
+}
+
+type App struct {
+	db    *sqlx.DB
+	redis *redis.Client
+}
+
+func main() {
+	// initialize DB
+	db := mustOpenDB(dbDSN)
+	defer db.Close()
+
+	// initialize Redis
+	r := redis.NewClient(&redis.Options{Addr: redisAddr})
+	if err := r.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("redis ping failed: %v", err)
+	}
+	defer r.Close()
+
+	app := &App{db: db, redis: r}
+
+	// run simple migrations (idempotent SQL files)
+	runMigrations(db)
+
+	router := chi.NewRouter()
+	router.Use(middleware.RequestID)
+	router.Use(middleware.RealIP)
+	router.Use(middleware.Logger)
+	router.Use(middleware.Recoverer)
+	router.Use(timeoutMiddleware(15 * time.Second))
+
+	// metrics
+	router.Handle("/metrics", promhttp.Handler())
+
+	// auth
+	router.Post("/register", app.handleRegister)
+	router.Post("/login", app.handleLogin)
+
+	// protected resources
+	router.Route("/api", func(r chi.Router) {
+		r.Use(app.authMiddleware)
+		r.Get("/customers", app.handleListCustomers)
+		r.Post("/customers", app.handleCreateCustomer)
+		r.Get("/customers/{id}", app.handleGetCustomer)
+		r.Put("/customers/{id}", app.handleUpdateCustomer)
+		r.Delete("/customers/{id}", app.handleDeleteCustomer)
+	})
+
+	srv := &http.Server{
+		Addr:    listen,
+		Handler: router,
+	}
+
+	// graceful shutdown
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		sigint := make(chan os.Signal, 1)
+		signal.Notify(sigint, syscall.SIGINT, syscall.SIGTERM)
+		<-sigint
+
+		log.Println("shutting down server...")
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server Shutdown: %v", err)
+		}
+		close(idleConnsClosed)
+	}()
+
+	log.Printf("%s listening on %s", serviceName, listen)
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("ListenAndServe(): %v", err)
+	}
+	<-idleConnsClosed
+}
+
+// ---------- Handlers & helpers ----------
+
+func (a *App) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req struct{
+		Email string `json:"email"`
+		Pass  string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	if req.Email == "" || req.Pass == "" {
+		http.Error(w, "missing fields", http.StatusBadRequest)
+		return
+	}
+	pw, err := bcrypt.GenerateFromPassword([]byte(req.Pass), bcrypt.DefaultCost)
+	if err != nil {
+		http.Error(w, "server error", http.StatusInternalServerError)
+		return
+	}
+	res, err := a.db.ExecContext(r.Context(), "INSERT INTO users (email, password) VALUES ($1,$2)", req.Email, string(pw))
+	if err != nil {
+		if strings.Contains(err.Error(), "unique") {
+			http.Error(w, "email exists", http.StatusConflict)
+			return
+		}
+		http.Error(w, "db error", http.StatusInternalServerError)
+		return
+	}
+	id, _ := res.LastInsertId()
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]any{"id": id})
+}
+
+func (a *App) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req struct{ Email, Pass string }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil { http.Error(w, "bad json", http.StatusBadRequest); return }
+	var u User
+	if err := a.db.GetContext(r.Context(), &u, "SELECT id,email,password FROM users WHERE email=$1", req.Email); err != nil {
+		if errors.Is(err, sql.ErrNoRows) { http.Error(w, "invalid credentials", http.StatusUnauthorized); return }
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(u.Password), []byte(req.Pass)) != nil {
+		http.Error(w, "invalid credentials", http.StatusUnauthorized); return
+	}
+	// create JWT
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub": u.ID,
+		"exp": time.Now().Add(24 * time.Hour).Unix(),
+	})
+	s, err := tok.SignedString(jwtSecret)
+	if err != nil { http.Error(w, "token error", http.StatusInternalServerError); return }
+	json.NewEncoder(w).Encode(map[string]string{"token": s})
+}
+
+func (a *App) handleCreateCustomer(w http.ResponseWriter, r *http.Request) {
+	var c Customer
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil { http.Error(w, "bad json", http.StatusBadRequest); return }
+	now := time.Now().UTC()
+	var id int64
+	if err := a.db.QueryRowxContext(r.Context(), "INSERT INTO customers (name,email,phone,created_at) VALUES ($1,$2,$3,$4) RETURNING id", c.Name, c.Email, c.Phone, now).Scan(&id); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	// invalidate cache list
+	a.redis.Del(r.Context(), "customers:page:1")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]int64{"id": id})
+}
+
+func (a *App) handleListCustomers(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	pageS := q.Get("page")
+	page, _ := strconv.Atoi(pageS)
+	if page < 1 { page = 1 }
+	limit := 25
+	cacheKey := fmt.Sprintf("customers:page:%d", page)
+	ctx := r.Context()
+	// try cache
+	if v, err := a.redis.Get(ctx, cacheKey).Result(); err == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(v))
+		return
+	}
+	// DB fetch with limit/offset — ensure indexes on created_at
+	offset := (page - 1) * limit
+	var rows []Customer
+	if err := a.db.SelectContext(ctx, &rows, "SELECT id,name,email,phone,created_at FROM customers ORDER BY created_at DESC LIMIT $1 OFFSET $2", limit, offset); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	b, _ := json.Marshal(rows)
+	// set cache with short TTL
+	a.redis.Set(ctx, cacheKey, string(b), 30*time.Second)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
+}
+
+func (a *App) handleGetCustomer(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	cacheKey := "customer:" + id
+	ctx := r.Context()
+	if v, err := a.redis.Get(ctx, cacheKey).Result(); err == nil {
+		w.Write([]byte(v)); return
+	}
+	var c Customer
+	if err := a.db.GetContext(ctx, &c, "SELECT id,name,email,phone,created_at FROM customers WHERE id=$1", id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) { http.Error(w, "not found", http.StatusNotFound); return }
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	b, _ := json.Marshal(c)
+	a.redis.Set(ctx, cacheKey, string(b), 60*time.Second)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(b)
+}
+
+func (a *App) handleUpdateCustomer(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var c Customer
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil { http.Error(w, "bad json", http.StatusBadRequest); return }
+	if _, err := a.db.ExecContext(r.Context(), "UPDATE customers SET name=$1,email=$2,phone=$3 WHERE id=$4", c.Name, c.Email, c.Phone, id); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	// invalidate cache
+	a.redis.Del(r.Context(), "customers:page:1", "customer:"+id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) handleDeleteCustomer(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if _, err := a.db.ExecContext(r.Context(), "DELETE FROM customers WHERE id=$1", id); err != nil {
+		http.Error(w, "db error", http.StatusInternalServerError); return
+	}
+	a.redis.Del(r.Context(), "customers:page:1", "customer:"+id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---------- Middleware ----------
+
+func (a *App) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if auth == "" { http.Error(w, "unauthorized", http.StatusUnauthorized); return }
+		parts := strings.SplitN(auth, " ", 2)
+		if len(parts) != 2 || parts[0] != "Bearer" { http.Error(w, "unauthorized", http.StatusUnauthorized); return }
+		tok, err := jwt.Parse(parts[1], func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok { return nil, fmt.Errorf("unexpected signing method") }
+			return jwtSecret, nil
+		})
+		if err != nil || !tok.Valid { http.Error(w, "unauthorized", http.StatusUnauthorized); return }
+		next.ServeHTTP(w, r)
+	})
+}
+
+// timeoutMiddleware attaches a context with timeout to each request
+func timeoutMiddleware(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ctx, cancel := context.WithTimeout(r.Context(), d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// ---------- DB & util ----------
+
+func mustOpenDB(dsn string) *sqlx.DB {
+	db, err := sqlx.Open("postgres", dsn)
+	if err != nil { log.Fatalf("db open: %v", err) }
+	db.SetMaxOpenConns(50)
+	db.SetMaxIdleConns(10)
+	db.SetConnMaxLifetime(30 * time.Minute)
+	if err := db.Ping(); err != nil { log.Fatalf("db ping: %v", err) }
+	return db
+}
+
+func runMigrations(db *sqlx.DB) {
+	// Simple migration runner that applies SQL files in migrations/. Keep idempotent statements.
+	entries, _ := migrations.ReadDir("migrations")
+	for _, e := range entries {
+		if e.IsDir() { continue }
+		b, _ := migrations.ReadFile("migrations/" + e.Name())
+		if _, err := db.Exec(string(b)); err != nil {
+			log.Printf("migration %s error: %v", e.Name(), err)
+		}
+	}
+}
+
+func getEnv(k, v string) string {
+	if x := os.Getenv(k); x != "" { return x }
+	return v
+}
